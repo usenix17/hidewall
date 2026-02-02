@@ -1,5 +1,5 @@
 # Multi-stage build for Go application
-FROM golang:1.23-alpine AS builder
+FROM golang:1.24-alpine AS builder
 
 LABEL version="5.0"
 LABEL org.opencontainers.image.authors="sasha@starnix.net"

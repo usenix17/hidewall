@@ -1,7 +1,7 @@
 # Hidewall
 
 [![Publish Docker image](https://github.com/sashakarcz/hidewall/actions/workflows/docker-image.yml/badge.svg)](https://github.com/sashakarcz/hidewall/actions/workflows/docker-image.yml)
-[![Go Version](https://img.shields.io/badge/Go-1.21+-00ADD8?style=flat&logo=go)](https://go.dev/)
+[![Go Version](https://img.shields.io/badge/Go-1.24+-00ADD8?style=flat&logo=go)](https://go.dev/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 ## About
@@ -56,7 +56,7 @@ Now in the [Chrome Store](https://chromewebstore.google.com/detail/hidewalls/klk
 ### Prerequisites
 
 - [Docker](https://docs.docker.com/get-docker/) and Docker Compose
-- Alternatively: Go 1.21+ for building from source
+- Alternatively: Go 1.24+ for building from source
 
 ### Quick Start with Docker Compose (Recommended)
 
@@ -157,7 +157,7 @@ https://hidewall.io/yeet?y=https%3A%2F%2Fwww.wsj.com%2Farticle%2Fexample
 
 ### Technology Stack
 
-- **Language**: Go 1.21+
+- **Language**: Go 1.24+
 - **Router**: Gorilla Mux
 - **HTML Parser**: goquery (jQuery-like API)
 - **Compression**: gzip and Brotli support
