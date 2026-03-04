@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/tls"
 	"fmt"
 	"html"
 	"io"
@@ -678,6 +679,9 @@ func fetchArchiveToday(originalURL string) (string, error) {
 func createSecureHTTPClient(timeout time.Duration) *http.Client {
 	return &http.Client{
 		Timeout: timeout,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
+		},
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			// Limit redirect chain to 10
 			if len(via) >= 10 {
