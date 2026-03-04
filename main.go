@@ -982,7 +982,7 @@ func handleFetchError(w http.ResponseWriter, err error, urlStr string) {
 			</ul>
 		`, html.EscapeString(urlStr))
 	} else if strings.Contains(errStr, "HTTP error") {
-		statusCode = http.StatusBadGateway
+		statusCode = http.StatusOK
 		errorTitle = "Site Access Error"
 		errorMessage = fmt.Sprintf(`
 			<p>We couldn't access the website you requested.</p>
