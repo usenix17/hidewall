@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
 	"io"
@@ -44,7 +45,6 @@ const (
 	AppRouteBypass = "/yeet"
 
 	// User-Agent strings
-	UserAgentGooglebot  = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
 	UserAgentGeneric    = "Mozilla/5.0 (PlayStation; PlayStation 5/6.50) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.4 Safari/605.1.15"
 	UserAgentTwitterbot = "Twitterbot/1.0"
 
@@ -65,6 +65,15 @@ var (
 	port         int
 	host         string
 )
+
+// redirectError signals that, rather than returning fetched content, the caller
+// should redirect the client's browser to the given URL (used to hand off
+// hard-paywall sites to archive.today, which cannot be fetched server-side).
+type redirectError struct {
+	url string
+}
+
+func (e *redirectError) Error() string { return "redirect to " + e.url }
 
 // HidewallApp represents the main application structure
 type HidewallApp struct {
@@ -305,6 +314,12 @@ func (app *HidewallApp) bypassPaywallHandler(w http.ResponseWriter, r *http.Requ
 
 	content, err := fetchAndProcessURL(cleanURL, userAgent)
 	if err != nil {
+		// Hard-paywall sites hand off to the user's browser via archive.today.
+		var re *redirectError
+		if errors.As(err, &re) {
+			http.Redirect(w, r, re.url, http.StatusFound)
+			return
+		}
 		handleFetchError(w, err, cleanURL)
 		return
 	}
@@ -566,154 +581,33 @@ func resolveSrcset(baseURL *url.URL, srcset string) string {
 	return strings.Join(resolved, ", ")
 }
 
-// fetchAndProcessURL fetches content from URL and processes it
+// fetchAndProcessURL fetches content from URL and processes it.
+//
+// Hard-paywall sites (blocked_sites.txt) now 403 every bot user-agent, and
+// archive.today CAPTCHA-gates server/datacenter IPs, so it cannot be proxied
+// server-side. For those sites we serve a clean Wayback snapshot in-tool when
+// one exists, and otherwise return a redirectError so the handler forwards the
+// user's own browser to archive.today (where a residential IP can pass the
+// CAPTCHA and load the article).
 func fetchAndProcessURL(urlStr, userAgent string) (string, error) {
-	// Try multiple bypass methods for problematic sites (those in blocked_sites.txt)
 	if isBlockedSite(urlStr) {
-
-		// Method 1: Try archive.today (search existing archives)
-		log.Printf("Trying Archive.today for problematic site: %s", urlStr)
-		content, err := fetchArchiveToday(urlStr)
-		if err == nil {
-			return content, nil
-		}
-		log.Printf("Archive.today failed: %v", err)
-
-		// Method 2: Try 12ft Ladder (with better validation)
-		log.Printf("Trying 12ft Ladder for problematic site: %s", urlStr)
-		ladderURL := "https://12ft.io/" + urlStr
-		content, err = fetchURLWithTimeout(ladderURL, UserAgentGeneric, 15*time.Second)
-		if err == nil {
-			return content, nil
-		}
-		log.Printf("12ft Ladder failed: %v", err)
-
-		// Method 3: Try Wayback Machine
+		// Prefer a clean in-tool render from the Wayback Machine when a real
+		// snapshot exists.
 		log.Printf("Trying Wayback Machine for problematic site: %s", urlStr)
-		content, err = fetchWaybackMachine(urlStr)
+		content, err := fetchWaybackMachine(urlStr)
 		if err == nil {
 			return content, nil
 		}
 		log.Printf("Wayback Machine failed: %v", err)
 
-		// Method 4: Google referrer with search engine bot
-		log.Printf("Trying Google referrer method for problematic site: %s", urlStr)
-		content, err = fetchURLWithReferrer(urlStr, UserAgentGooglebot, "https://www.google.com")
-		if err == nil {
-			return content, nil
-		}
-		log.Printf("Google referrer failed: %v", err)
-
-		log.Printf("All bypass methods failed for: %s", urlStr)
-		return "", fmt.Errorf("all bypass methods failed")
+		// No usable snapshot: hand off to the user's browser via archive.today.
+		archiveURL := "https://archive.ph/newest/" + urlStr
+		log.Printf("Redirecting to archive.today for problematic site: %s", archiveURL)
+		return "", &redirectError{url: archiveURL}
 	}
 
-	// For regular sites or fallback: use the selected user agent (usually Twitterbot)
+	// For regular sites: use the selected user agent (usually Twitterbot).
 	return fetchURL(urlStr, userAgent)
-}
-
-// fetchArchiveToday tries to get content from archive.today by searching existing archives
-func fetchArchiveToday(originalURL string) (string, error) {
-	// List of archive.today domains to try
-	archiveDomains := []string{
-		"https://archive.today/",
-		"https://archive.ph/",
-		"https://archive.is/",
-		"https://archive.vn/",
-	}
-
-	for _, domain := range archiveDomains {
-		log.Printf("Trying %s for: %s", domain, originalURL)
-
-		// The /newest/ endpoint redirects straight to the most recent capture
-		// of the URL if one exists, avoiding archive.today's snapshot-list and
-		// search-form pages.
-		searchURL := domain + "newest/" + originalURL
-
-		// Keep per-domain timeout modest: /newest/ is a redirect to an existing
-		// capture, and 4 domains * a long timeout could blow past Cloudflare's
-		// ~100s proxy limit when chained with the other bypass methods.
-		client := createSecureHTTPClient(10 * time.Second)
-
-		req, err := http.NewRequest("GET", searchURL, nil)
-		if err != nil {
-			continue
-		}
-
-		// Use a real browser user agent to avoid blocking
-		req.Header.Set("User-Agent", UserAgentGeneric)
-		req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-		req.Header.Set("Accept-Language", "en-US,en;q=0.5")
-
-		resp, err := client.Do(req)
-		if err != nil {
-			log.Printf("Request to %s failed: %v", domain, err)
-			continue
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode == 429 {
-			log.Printf("Rate limited by %s", domain)
-			continue
-		}
-
-		if resp.StatusCode >= 400 {
-			log.Printf("HTTP error %d from %s", resp.StatusCode, domain)
-			continue
-		}
-
-		// Limit response size
-		body, err := io.ReadAll(io.LimitReader(resp.Body, MaxResponseSize))
-		if err != nil {
-			continue
-		}
-
-		// Parse HTML with goquery
-		doc, err := goquery.NewDocumentFromReader(bytes.NewReader(body))
-		if err != nil {
-			continue
-		}
-
-		// Check if this is a valid archived page
-		pageText := doc.Text()
-		pageHTML := string(body)
-
-		// Skip if it's an error page, search page, or archive.today's home page
-		if strings.Contains(pageText, "No results found") ||
-			strings.Contains(pageText, "Enter a URL to search") ||
-			strings.Contains(pageText, "This page shows only") ||
-			strings.Contains(pageHTML, "id=\"search_form\"") ||
-			strings.Contains(pageText, "archive.today") && len(pageText) < 2000 {
-			log.Printf("Got archive.today search page, not actual content from %s", domain)
-			continue
-		}
-
-		// Skip archived paywall/bot-block pages (a capture of the paywall is
-		// not the article).
-		if looksLikeBlockPage(pageText) {
-			log.Printf("Archived page from %s is a block/paywall page, skipping", domain)
-			continue
-		}
-
-		// Check if we got actual article content (should be substantial)
-		if len(pageText) < 1000 {
-			log.Printf("Page too short from %s, likely not the actual article", domain)
-			continue
-		}
-
-		log.Printf("Successfully found archived content on %s", domain)
-
-		// Process the content
-		processHTMLContent(doc, originalURL)
-		html, err := doc.Html()
-		if err != nil {
-			continue
-		}
-
-		return html, nil
-	}
-
-	return "", fmt.Errorf("no existing archives found on archive.today domains")
 }
 
 // safeDialContext resolves the target host and refuses to connect if any
@@ -788,84 +682,6 @@ func createSecureHTTPClient(timeout time.Duration) *http.Client {
 			return nil
 		},
 	}
-}
-
-// fetchURLWithTimeout fetches URL with a specific timeout
-func fetchURLWithTimeout(urlStr, userAgent string, timeout time.Duration) (string, error) {
-	client := createSecureHTTPClient(timeout)
-
-	req, err := http.NewRequest("GET", urlStr, nil)
-	if err != nil {
-		return "", fmt.Errorf("failed to create request: %w", err)
-	}
-
-	req.Header.Set("User-Agent", userAgent)
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.5")
-	req.Header.Set("Accept-Encoding", "gzip, br")
-	req.Header.Set("Connection", "keep-alive")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		return "", fmt.Errorf("HTTP error %d", resp.StatusCode)
-	}
-
-	// Limit response size to prevent memory exhaustion
-	body, err := io.ReadAll(io.LimitReader(resp.Body, MaxResponseSize))
-	if err != nil {
-		return "", fmt.Errorf("failed to read response body: %w", err)
-	}
-
-	// Decompress content if needed
-	contentEncoding := resp.Header.Get("Content-Encoding")
-	decompressedBody, err := decompressContent(body, contentEncoding)
-	if err != nil {
-		log.Printf("Decompression error: %v", err)
-		decompressedBody = body
-	}
-
-	// Parse HTML with goquery
-	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(decompressedBody))
-	if err != nil {
-		return "", fmt.Errorf("failed to parse HTML: %w", err)
-	}
-
-	// Check if this is a 12ft Ladder error page or processing page
-	if strings.Contains(urlStr, "12ft.io") {
-		pageText := doc.Text()
-		if strings.Contains(pageText, "Cleaning Webpage") ||
-			strings.Contains(pageText, "You can talk 3x faster") ||
-			strings.Contains(pageText, "12ft.io") ||
-			len(pageText) < 500 {
-			return "", fmt.Errorf("12ft Ladder failed to process the page")
-		}
-	}
-
-	// Check if this is an Outline.com error page
-	if strings.Contains(urlStr, "outline.com") {
-		pageText := doc.Text()
-		if strings.Contains(pageText, "couldn't parse") ||
-			strings.Contains(pageText, "Sorry, Outline") ||
-			len(pageText) < 500 {
-			return "", fmt.Errorf("Outline.com failed to process the page")
-		}
-	}
-
-	// Process HTML content
-	processHTMLContent(doc, urlStr)
-
-	// Return the modified HTML
-	html, err := doc.Html()
-	if err != nil {
-		return "", fmt.Errorf("failed to generate HTML: %w", err)
-	}
-
-	return html, nil
 }
 
 // waybackAvailability mirrors the JSON returned by the Wayback "available" API.
@@ -1002,70 +818,6 @@ func fetchWaybackMachine(originalURL string) (string, error) {
 	html, err := doc.Html()
 	if err != nil {
 		return "", fmt.Errorf("failed to generate HTML from wayback: %w", err)
-	}
-
-	return html, nil
-}
-
-// fetchURLWithReferrer fetches URL with a specific referrer header
-func fetchURLWithReferrer(urlStr, userAgent, referrer string) (string, error) {
-	client := createSecureHTTPClient(RequestTimeout)
-
-	req, err := http.NewRequest("GET", urlStr, nil)
-	if err != nil {
-		return "", fmt.Errorf("failed to create request: %w", err)
-	}
-
-	// Set headers including referrer
-	req.Header.Set("User-Agent", userAgent)
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.5")
-	req.Header.Set("Accept-Encoding", "gzip, br")
-	req.Header.Set("Connection", "keep-alive")
-	req.Header.Set("Upgrade-Insecure-Requests", "1")
-	req.Header.Set("Cache-Control", "max-age=0")
-	req.Header.Set("Referer", referrer)
-
-	// Don't send cookies for paywall bypass (as suggested in GitHub repo)
-	// req.Header.Set("Cookie", "") // This is default behavior anyway
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		return "", fmt.Errorf("HTTP error %d", resp.StatusCode)
-	}
-
-	// Limit response size
-	body, err := io.ReadAll(io.LimitReader(resp.Body, MaxResponseSize))
-	if err != nil {
-		return "", fmt.Errorf("failed to read response body: %w", err)
-	}
-
-	// Decompress content if needed
-	contentEncoding := resp.Header.Get("Content-Encoding")
-	decompressedBody, err := decompressContent(body, contentEncoding)
-	if err != nil {
-		log.Printf("Decompression error: %v", err)
-		decompressedBody = body
-	}
-
-	// Parse HTML with goquery
-	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(decompressedBody))
-	if err != nil {
-		return "", fmt.Errorf("failed to parse HTML: %w", err)
-	}
-
-	// Process HTML content
-	processHTMLContent(doc, urlStr)
-
-	// Return the modified HTML
-	html, err := doc.Html()
-	if err != nil {
-		return "", fmt.Errorf("failed to generate HTML: %w", err)
 	}
 
 	return html, nil
