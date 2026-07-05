@@ -1,5 +1,13 @@
 # Some sites don't play well with others. Those sites go here.
+# Sites listed here skip the direct bot-user-agent fetch (which they now 403)
+# and go straight to the archive/bypass pipeline.
 bloomberg.com
 telegraph.co.uk
 theatlantic.com
 wsj.com
+nytimes.com
+washingtonpost.com
+ft.com
+economist.com
+newyorker.com
+wired.com

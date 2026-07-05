@@ -6,6 +6,7 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"html"
 	"io"
@@ -37,10 +38,10 @@ const (
 	JavaScriptServiceWorker = "service-worker.js"
 
 	// URL paths for routes
-	StaticURLPath   = "/static/"
-	AppRouteRoot    = "/"
-	AppRouteJS      = "/" + JavaScriptServiceWorker
-	AppRouteBypass  = "/yeet"
+	StaticURLPath  = "/static/"
+	AppRouteRoot   = "/"
+	AppRouteJS     = "/" + JavaScriptServiceWorker
+	AppRouteBypass = "/yeet"
 
 	// User-Agent strings
 	UserAgentGooglebot  = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
@@ -86,15 +87,23 @@ func newRateLimiter() *rateLimiter {
 
 // getLimiter returns the rate limiter for a given IP
 func (rl *rateLimiter) getLimiter(ip string) *rate.Limiter {
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
-
+	// Fast path: most requests hit an existing limiter, so take a read lock.
+	rl.mu.RLock()
 	limiter, exists := rl.visitors[ip]
-	if !exists {
-		limiter = rate.NewLimiter(rate.Every(RateLimitWindow/RateLimitRequests), RateLimitRequests)
-		rl.visitors[ip] = limiter
+	rl.mu.RUnlock()
+	if exists {
+		return limiter
 	}
 
+	// Slow path: create the limiter under a write lock, re-checking in case
+	// another goroutine created it between releasing RLock and taking Lock.
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	if limiter, exists = rl.visitors[ip]; exists {
+		return limiter
+	}
+	limiter = rate.NewLimiter(rate.Every(RateLimitWindow/RateLimitRequests), RateLimitRequests)
+	rl.visitors[ip] = limiter
 	return limiter
 }
 
@@ -161,6 +170,13 @@ func (app *HidewallApp) securityHeadersMiddleware(next http.Handler) http.Handle
 // rateLimitMiddleware implements rate limiting per IP
 func (app *HidewallApp) rateLimitMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Static assets are cheap and numerous (a single page load pulls CSS,
+		// fonts, icons, manifest); only rate-limit the expensive proxy route.
+		if r.URL.Path != AppRouteBypass {
+			next.ServeHTTP(w, r)
+			return
+		}
+
 		ip := getClientIP(r)
 		limiter := app.rateLimiter.getLimiter(ip)
 
@@ -173,24 +189,20 @@ func (app *HidewallApp) rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// getClientIP extracts the real client IP from the request
+// getClientIP extracts the real client IP from the request.
+//
+// The origin firewall only accepts inbound traffic from Cloudflare (see
+// Terraform/modules/linode_firewall_cloudflare), so CF-Connecting-IP is set by
+// Cloudflare to the true client and cannot be forged by end users. We must NOT
+// trust X-Forwarded-For's first entry here: it is client-controlled and would
+// let anyone defeat rate limiting by rotating the header.
 func getClientIP(r *http.Request) string {
-	// Check X-Forwarded-For header first (for proxied requests)
-	xff := r.Header.Get("X-Forwarded-For")
-	if xff != "" {
-		ips := strings.Split(xff, ",")
-		if len(ips) > 0 {
-			return strings.TrimSpace(ips[0])
-		}
+	if cf := strings.TrimSpace(r.Header.Get("CF-Connecting-IP")); cf != "" {
+		return cf
 	}
 
-	// Check X-Real-IP header
-	xri := r.Header.Get("X-Real-IP")
-	if xri != "" {
-		return xri
-	}
-
-	// Fallback to RemoteAddr
+	// Fallback for non-Cloudflare deployments: use the connection's remote
+	// address, which cannot be spoofed at the application layer.
 	ip, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		return r.RemoteAddr
@@ -304,6 +316,15 @@ func (app *HidewallApp) bypassPaywallHandler(w http.ResponseWriter, r *http.Requ
 // isValidURL validates if a given string is a well-formed HTTP or HTTPS URL
 // and protects against SSRF attacks
 func isValidURL(urlStr string) bool {
+	// Cheap checks first, before any DNS resolution, to avoid spending a
+	// network lookup on obviously invalid or oversized input.
+	if len(urlStr) > 2048 {
+		return false
+	}
+	if !strings.HasPrefix(urlStr, "http://") && !strings.HasPrefix(urlStr, "https://") {
+		return false
+	}
+
 	// Parse the URL
 	parsedURL, err := url.Parse(urlStr)
 	if err != nil {
@@ -321,19 +342,11 @@ func isValidURL(urlStr string) bool {
 		return false
 	}
 
-	// Prevent SSRF attacks - block private IP ranges and localhost
+	// Prevent SSRF attacks - block private IP ranges and localhost. Note this
+	// is a fast-fail check only; the authoritative SSRF guard is the dial-time
+	// IP validation in safeDialContext, which is immune to DNS rebinding.
 	if isPrivateOrLocalhost(hostname) {
 		log.Printf("Blocked attempt to access private/localhost URL: %s", urlStr)
-		return false
-	}
-
-	// Validate URL structure with simpler regex to prevent ReDoS
-	if len(urlStr) > 2048 {
-		return false
-	}
-
-	// Basic validation that it looks like a URL
-	if !strings.HasPrefix(urlStr, "http://") && !strings.HasPrefix(urlStr, "https://") {
 		return false
 	}
 
@@ -464,8 +477,7 @@ func processHTMLContent(doc *goquery.Document, baseURL string) {
 
 		// Handle data-gl-srcset attribute
 		if dataSrcset, exists := s.Attr("data-gl-srcset"); exists {
-			absoluteURL := resolveURL(parsedBaseURL, dataSrcset)
-			s.SetAttr("srcset", absoluteURL)
+			s.SetAttr("srcset", resolveSrcset(parsedBaseURL, dataSrcset))
 			s.RemoveAttr("data-gl-srcset")
 		}
 
@@ -476,9 +488,8 @@ func processHTMLContent(doc *goquery.Document, baseURL string) {
 		}
 
 		// Handle srcset attribute
-		if srcset, exists := s.Attr("srcset"); exists && !strings.HasPrefix(srcset, "http") {
-			absoluteURL := resolveURL(parsedBaseURL, srcset)
-			s.SetAttr("srcset", absoluteURL)
+		if srcset, exists := s.Attr("srcset"); exists {
+			s.SetAttr("srcset", resolveSrcset(parsedBaseURL, srcset))
 		}
 	})
 
@@ -537,11 +548,29 @@ func resolveURL(baseURL *url.URL, relativeURL string) string {
 	return baseURL.ResolveReference(parsed).String()
 }
 
+// resolveSrcset resolves every candidate in a srcset attribute against the base
+// URL while preserving each candidate's descriptor (e.g. "2x" or "640w"). A
+// srcset is a comma-separated list of "<url> [descriptor]" entries, so we must
+// not treat the whole string as a single URL.
+func resolveSrcset(baseURL *url.URL, srcset string) string {
+	candidates := strings.Split(srcset, ",")
+	resolved := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		parts := strings.Fields(strings.TrimSpace(candidate))
+		if len(parts) == 0 {
+			continue
+		}
+		parts[0] = resolveURL(baseURL, parts[0])
+		resolved = append(resolved, strings.Join(parts, " "))
+	}
+	return strings.Join(resolved, ", ")
+}
+
 // fetchAndProcessURL fetches content from URL and processes it
 func fetchAndProcessURL(urlStr, userAgent string) (string, error) {
 	// Try multiple bypass methods for problematic sites (those in blocked_sites.txt)
 	if isBlockedSite(urlStr) {
-		
+
 		// Method 1: Try archive.today (search existing archives)
 		log.Printf("Trying Archive.today for problematic site: %s", urlStr)
 		content, err := fetchArchiveToday(urlStr)
@@ -596,9 +625,14 @@ func fetchArchiveToday(originalURL string) (string, error) {
 	for _, domain := range archiveDomains {
 		log.Printf("Trying %s for: %s", domain, originalURL)
 
-		// Search for existing archives by appending the URL
-		searchURL := domain + originalURL
+		// The /newest/ endpoint redirects straight to the most recent capture
+		// of the URL if one exists, avoiding archive.today's snapshot-list and
+		// search-form pages.
+		searchURL := domain + "newest/" + originalURL
 
+		// Keep per-domain timeout modest: /newest/ is a redirect to an existing
+		// capture, and 4 domains * a long timeout could blow past Cloudflare's
+		// ~100s proxy limit when chained with the other bypass methods.
 		client := createSecureHTTPClient(10 * time.Second)
 
 		req, err := http.NewRequest("GET", searchURL, nil)
@@ -643,14 +677,21 @@ func fetchArchiveToday(originalURL string) (string, error) {
 		// Check if this is a valid archived page
 		pageText := doc.Text()
 		pageHTML := string(body)
-		
+
 		// Skip if it's an error page, search page, or archive.today's home page
 		if strings.Contains(pageText, "No results found") ||
-		   strings.Contains(pageText, "Enter a URL to search") ||
-		   strings.Contains(pageText, "This page shows only") ||
-		   strings.Contains(pageHTML, "id=\"search_form\"") ||
-		   strings.Contains(pageText, "archive.today") && len(pageText) < 2000 {
+			strings.Contains(pageText, "Enter a URL to search") ||
+			strings.Contains(pageText, "This page shows only") ||
+			strings.Contains(pageHTML, "id=\"search_form\"") ||
+			strings.Contains(pageText, "archive.today") && len(pageText) < 2000 {
 			log.Printf("Got archive.today search page, not actual content from %s", domain)
+			continue
+		}
+
+		// Skip archived paywall/bot-block pages (a capture of the paywall is
+		// not the article).
+		if looksLikeBlockPage(pageText) {
+			log.Printf("Archived page from %s is a block/paywall page, skipping", domain)
 			continue
 		}
 
@@ -661,7 +702,7 @@ func fetchArchiveToday(originalURL string) (string, error) {
 		}
 
 		log.Printf("Successfully found archived content on %s", domain)
-		
+
 		// Process the content
 		processHTMLContent(doc, originalURL)
 		html, err := doc.Html()
@@ -675,19 +716,72 @@ func fetchArchiveToday(originalURL string) (string, error) {
 	return "", fmt.Errorf("no existing archives found on archive.today domains")
 }
 
-// createSecureHTTPClient creates an HTTP client with security settings
+// safeDialContext resolves the target host and refuses to connect if any
+// resolved address is private, loopback, or link-local. Because it performs the
+// DNS lookup and the actual dial itself (dialing the resolved IP, not the
+// hostname), it closes the DNS-rebinding TOCTOU gap that a validate-then-fetch
+// approach leaves open: there is no second, unvalidated resolution.
+func safeDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+
+	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
+	if err != nil {
+		return nil, err
+	}
+
+	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+	var lastErr error
+	for _, ip := range ips {
+		// Conservative: if ANY resolved address is private, reject outright
+		// rather than trying to cherry-pick a "safe" one.
+		if isPrivateIP(ip) {
+			return nil, fmt.Errorf("blocked connection to private address %s", ip)
+		}
+	}
+	for _, ip := range ips {
+		conn, err := dialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), portStr))
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no addresses found for %s", host)
+	}
+	return nil, lastErr
+}
+
+// secureTransport is shared across all outbound requests so that connections
+// (and their TLS sessions) are pooled and reused rather than rebuilt per call.
+var secureTransport = &http.Transport{
+	DialContext:           safeDialContext,
+	TLSClientConfig:       &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
+	MaxIdleConns:          100,
+	MaxIdleConnsPerHost:   10,
+	IdleConnTimeout:       90 * time.Second,
+	TLSHandshakeTimeout:   10 * time.Second,
+	ExpectContinueTimeout: 1 * time.Second,
+	ForceAttemptHTTP2:     true,
+}
+
+// createSecureHTTPClient creates an HTTP client with security settings. The
+// per-request timeout varies by caller, but the underlying transport (with its
+// SSRF-safe dialer and connection pool) is shared.
 func createSecureHTTPClient(timeout time.Duration) *http.Client {
 	return &http.Client{
-		Timeout: timeout,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
-		},
+		Timeout:   timeout,
+		Transport: secureTransport,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			// Limit redirect chain to 10
 			if len(via) >= 10 {
 				return fmt.Errorf("too many redirects")
 			}
-			// Validate redirect target to prevent open redirects to private networks
+			// safeDialContext already blocks private targets at dial time; this
+			// is a fast-fail so we don't waste a connection on an obvious open
+			// redirect to an internal address.
 			if isPrivateOrLocalhost(req.URL.Hostname()) {
 				return fmt.Errorf("redirect to private or localhost address blocked")
 			}
@@ -708,7 +802,7 @@ func fetchURLWithTimeout(urlStr, userAgent string, timeout time.Duration) (strin
 	req.Header.Set("User-Agent", userAgent)
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.5")
-	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
+	req.Header.Set("Accept-Encoding", "gzip, br")
 	req.Header.Set("Connection", "keep-alive")
 
 	resp, err := client.Do(req)
@@ -744,10 +838,10 @@ func fetchURLWithTimeout(urlStr, userAgent string, timeout time.Duration) (strin
 	// Check if this is a 12ft Ladder error page or processing page
 	if strings.Contains(urlStr, "12ft.io") {
 		pageText := doc.Text()
-		if strings.Contains(pageText, "Cleaning Webpage") || 
-		   strings.Contains(pageText, "You can talk 3x faster") ||
-		   strings.Contains(pageText, "12ft.io") ||
-		   len(pageText) < 500 {
+		if strings.Contains(pageText, "Cleaning Webpage") ||
+			strings.Contains(pageText, "You can talk 3x faster") ||
+			strings.Contains(pageText, "12ft.io") ||
+			len(pageText) < 500 {
 			return "", fmt.Errorf("12ft Ladder failed to process the page")
 		}
 	}
@@ -756,8 +850,8 @@ func fetchURLWithTimeout(urlStr, userAgent string, timeout time.Duration) (strin
 	if strings.Contains(urlStr, "outline.com") {
 		pageText := doc.Text()
 		if strings.Contains(pageText, "couldn't parse") ||
-		   strings.Contains(pageText, "Sorry, Outline") ||
-		   len(pageText) < 500 {
+			strings.Contains(pageText, "Sorry, Outline") ||
+			len(pageText) < 500 {
 			return "", fmt.Errorf("Outline.com failed to process the page")
 		}
 	}
@@ -774,24 +868,106 @@ func fetchURLWithTimeout(urlStr, userAgent string, timeout time.Duration) (strin
 	return html, nil
 }
 
-// fetchWaybackMachine tries to get content from Internet Archive
-func fetchWaybackMachine(originalURL string) (string, error) {
-	// Try to get the latest snapshot
-	waybackURL := "https://web.archive.org/web/2/" + originalURL
+// waybackAvailability mirrors the JSON returned by the Wayback "available" API.
+type waybackAvailability struct {
+	ArchivedSnapshots struct {
+		Closest struct {
+			Available bool   `json:"available"`
+			URL       string `json:"url"`
+			Status    string `json:"status"`
+			Timestamp string `json:"timestamp"`
+		} `json:"closest"`
+	} `json:"archived_snapshots"`
+}
 
+// looksLikeBlockPage reports whether extracted page text is actually a paywall,
+// bot-block, or error page rather than real article content. Fresh paywalled
+// articles (e.g. NYT) that get captured on demand archive the "Not Authorized"
+// page, so an archive returning HTTP 200 is not enough on its own.
+func looksLikeBlockPage(pageText string) bool {
+	markers := []string{
+		"Not Authorized",
+		"Access to this page has been denied",
+		"Access Denied",
+		"Please enable JS",
+		"Please enable JavaScript",
+		"enable cookies",
+		"unusual traffic",
+		"are you a robot",
+		"Verifying you are human",
+		"Just a moment...",   // Cloudflare challenge
+		"Attention Required", // Cloudflare block
+		"subscribe to continue",
+		"Please verify you are a human",
+	}
+	for _, m := range markers {
+		if strings.Contains(pageText, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// fetchWaybackMachine gets content from the Internet Archive. It first queries
+// the availability API for an EXISTING 200 snapshot instead of hitting
+// /web/2/, which for un-archived pages triggers an on-demand capture that
+// merely archives the live paywall/403 page. The archived HTML is then fetched
+// in raw form (the "id_" replay modifier) so we get the original page without
+// the Wayback toolbar wrapper.
+func fetchWaybackMachine(originalURL string) (string, error) {
 	client := createSecureHTTPClient(20 * time.Second) // Wayback can be slow
 
-	req, err := http.NewRequest("GET", waybackURL, nil)
+	// Step 1: ask the availability API whether a real snapshot exists.
+	apiURL := "https://archive.org/wayback/available?url=" + url.QueryEscape(originalURL)
+	req, err := http.NewRequest("GET", apiURL, nil)
 	if err != nil {
-		return "", fmt.Errorf("failed to create wayback request: %w", err)
+		return "", fmt.Errorf("failed to create wayback availability request: %w", err)
 	}
-
 	req.Header.Set("User-Agent", UserAgentGeneric)
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("wayback request failed: %w", err)
+		return "", fmt.Errorf("wayback availability request failed: %w", err)
+	}
+	apiBody, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	resp.Body.Close()
+	if err != nil {
+		return "", fmt.Errorf("failed to read wayback availability: %w", err)
+	}
+
+	var avail waybackAvailability
+	if err := json.Unmarshal(apiBody, &avail); err != nil {
+		return "", fmt.Errorf("failed to parse wayback availability: %w", err)
+	}
+	snap := avail.ArchivedSnapshots.Closest
+	if !snap.Available || snap.URL == "" {
+		return "", fmt.Errorf("no wayback snapshot available")
+	}
+	// Only trust snapshots the archive captured successfully; a snapshot of a
+	// 403/404 is worse than nothing.
+	if snap.Status != "" && snap.Status != "200" {
+		return "", fmt.Errorf("wayback snapshot has status %s, not 200", snap.Status)
+	}
+
+	// Step 2: build the raw ("id_") replay URL and fetch the archived HTML.
+	rawURL := snap.URL
+	if snap.Timestamp != "" {
+		rawURL = strings.Replace(rawURL, "/web/"+snap.Timestamp+"/", "/web/"+snap.Timestamp+"id_/", 1)
+	}
+	// Normalize to https to avoid an extra redirect hop.
+	rawURL = strings.Replace(rawURL, "http://web.archive.org", "https://web.archive.org", 1)
+
+	req, err = http.NewRequest("GET", rawURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to create wayback snapshot request: %w", err)
+	}
+	req.Header.Set("User-Agent", UserAgentGeneric)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	req.Header.Set("Accept-Encoding", "gzip, br")
+
+	resp, err = client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("wayback snapshot request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -799,19 +975,29 @@ func fetchWaybackMachine(originalURL string) (string, error) {
 		return "", fmt.Errorf("wayback HTTP error %d", resp.StatusCode)
 	}
 
-	// Limit response size
 	body, err := io.ReadAll(io.LimitReader(resp.Body, MaxResponseSize))
 	if err != nil {
 		return "", fmt.Errorf("failed to read wayback response: %w", err)
 	}
 
-	// Parse HTML with goquery
-	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(body))
+	contentEncoding := resp.Header.Get("Content-Encoding")
+	decompressedBody, derr := decompressContent(body, contentEncoding)
+	if derr != nil {
+		log.Printf("Decompression error: %v", derr)
+		decompressedBody = body
+	}
+
+	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(decompressedBody))
 	if err != nil {
 		return "", fmt.Errorf("failed to parse wayback HTML: %w", err)
 	}
 
-	// Process the content
+	// Reject archived block/paywall pages and empty captures.
+	pageText := doc.Text()
+	if looksLikeBlockPage(pageText) || len(strings.TrimSpace(pageText)) < 1000 {
+		return "", fmt.Errorf("wayback snapshot is a block/paywall or empty page")
+	}
+
 	processHTMLContent(doc, originalURL)
 	html, err := doc.Html()
 	if err != nil {
@@ -834,12 +1020,12 @@ func fetchURLWithReferrer(urlStr, userAgent, referrer string) (string, error) {
 	req.Header.Set("User-Agent", userAgent)
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.5")
-	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
+	req.Header.Set("Accept-Encoding", "gzip, br")
 	req.Header.Set("Connection", "keep-alive")
 	req.Header.Set("Upgrade-Insecure-Requests", "1")
 	req.Header.Set("Cache-Control", "max-age=0")
 	req.Header.Set("Referer", referrer)
-	
+
 	// Don't send cookies for paywall bypass (as suggested in GitHub repo)
 	// req.Header.Set("Cookie", "") // This is default behavior anyway
 
@@ -898,11 +1084,11 @@ func fetchURL(urlStr, userAgent string) (string, error) {
 	req.Header.Set("User-Agent", userAgent)
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.5")
-	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
+	req.Header.Set("Accept-Encoding", "gzip, br")
 	req.Header.Set("Connection", "keep-alive")
 	req.Header.Set("Upgrade-Insecure-Requests", "1")
 	req.Header.Set("Cache-Control", "max-age=0")
-	
+
 	// Add referrer for Facebook redirects
 	if strings.Contains(urlStr, "facebook.com/l.php") {
 		req.Header.Set("Referer", "https://facebook.com/")
@@ -957,11 +1143,11 @@ func handleFetchError(w http.ResponseWriter, err error, urlStr string) {
 
 	// Create a nicely formatted error page that matches the site's design
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	
+
 	var statusCode int
 	var errorTitle string
 	var errorMessage string
-	
+
 	if strings.Contains(errStr, "all bypass methods failed") {
 		statusCode = http.StatusServiceUnavailable
 		errorTitle = "Paywall Bypass Failed"
@@ -1089,7 +1275,7 @@ func loadBlockedSites() {
 // initConfig initializes configuration from environment variables
 func initConfig() {
 	var err error
-	
+
 	// Get port from environment variable or use default
 	portStr := os.Getenv("PORT")
 	if portStr != "" {
@@ -1120,12 +1306,18 @@ func main() {
 	app := NewHidewallApp()
 
 	// Create server
+	// WriteTimeout must exceed the worst-case bypass pipeline: a blocked site
+	// serially tries archive.today (10s) + 12ft (15s) + Wayback (20s) + Google
+	// referrer (10s), plus HTML processing. A 15s WriteTimeout would sever the
+	// connection mid-pipeline and truncate the response. ReadHeaderTimeout
+	// retains slowloris protection on the request side.
 	server := &http.Server{
-		Addr:         fmt.Sprintf("%s:%d", host, port),
-		Handler:      app,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		Addr:              fmt.Sprintf("%s:%d", host, port),
+		Handler:           app,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      90 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	// Channel to listen for interrupt signals
